@@ -1,0 +1,17 @@
+# Podcast Two-Speaker Conversation Extractor
+# ============================================
+# Install with: pip install -r requirements.txt
+#
+# NOTE: Install PyTorch with CUDA FIRST (before this file):
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# ── Diarization ───────────────────────────────────────────────
+pyannote.audio==3.3.2
+
+# ── Audio processing ──────────────────────────────────────────
+pydub>=0.25.1
+soundfile>=0.12.1
+librosa>=0.10.0
+
+# ── Utilities ─────────────────────────────────────────────────
+numpy>=1.24.0
