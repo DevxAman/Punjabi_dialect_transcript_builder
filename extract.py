@@ -11,11 +11,10 @@ Usage:
 import os
 import argparse
 import logging
-from pathlib import Path
+from collections import Counter
 
 import torch
 import numpy as np
-import soundfile as sf
 from pydub import AudioSegment
 
 logging.basicConfig(
@@ -115,94 +114,170 @@ class Diarizer:
 class ConversationDetector:
     def __init__(
         self,
-        max_gap_sec: float = 5.0,
+        max_gap_sec: float = 2.5,
         min_exchanges: int = 3,
-        min_block_duration: float = 10.0,
-        max_speakers: int = 2,
+        min_block_duration: float = 5.0,
+        window_size_sec: float = 8.0,
+        window_hop_sec: float = 4.0,
     ):
-        """
-        max_gap_sec       : max silence between turns to stay in same conversation block
-        min_exchanges     : minimum speaker alternations (A→B→A counts as 2)
-        min_block_duration: discard blocks shorter than this (seconds)
-        max_speakers      : only keep blocks with exactly this many speakers (2 = dialogue)
-        """
         self.max_gap_sec = max_gap_sec
         self.min_exchanges = min_exchanges
         self.min_block_duration = min_block_duration
-        self.max_speakers = max_speakers
+        self.window_size_sec = window_size_sec
+        self.window_hop_sec = window_hop_sec
 
     def extract(self, turns: list) -> list:
-        """
-        Groups turns into conversation blocks.
-        Returns list of blocks, each block is a list of turns.
-        Only returns blocks with exactly 2 speakers and enough back-and-forth.
-        """
         if not turns:
             return []
 
-        blocks = []
-        current = [turns[0]]
+        turns = sorted(turns, key=lambda x: x["start"])
+        accepted = []
+        audio_end = max(t["end"] for t in turns)
+        win_start = turns[0]["start"]
 
-        for i in range(1, len(turns)):
-            prev = turns[i - 1]
-            curr = turns[i]
-            gap = curr["start"] - prev["end"]
+        while win_start < audio_end:
+            win_end = win_start + self.window_size_sec
+            window_turns = self._slice_window(turns, win_start, win_end)
+            block = self._validate_window(window_turns, win_start, win_end)
+            if block:
+                accepted.append(block)
+            win_start += self.window_hop_sec
 
-            if gap <= self.max_gap_sec:
-                current.append(curr)
-            else:
-                block = self._evaluate(current)
-                if block:
-                    blocks.append(block)
-                current = [curr]
+        merged = self._merge_adjacent_blocks(accepted)
+        log.info(f"Conversation detector: {len(merged)} valid dialogue blocks found")
+        return merged
 
-        # Last block
-        block = self._evaluate(current)
-        if block:
-            blocks.append(block)
+    @staticmethod
+    def _slice_window(turns: list, win_start: float, win_end: float) -> list:
+        window_turns = []
+        for t in turns:
+            if t["end"] <= win_start or t["start"] >= win_end:
+                continue
+            clipped = {
+                "speaker": t["speaker"],
+                "start": max(t["start"], win_start),
+                "end": min(t["end"], win_end),
+            }
+            if clipped["end"] > clipped["start"]:
+                window_turns.append(clipped)
+        return sorted(window_turns, key=lambda x: x["start"])
 
-        log.info(f"Conversation detector: {len(blocks)} valid dialogue blocks found")
-        return blocks
-
-    def _evaluate(self, turns: list):
-        """Returns block dict if it passes all filters, else None."""
+    def _validate_window(self, turns: list, win_start: float, win_end: float):
         if not turns:
             return None
 
-        all_speakers = [t["speaker"] for t in turns]
-        speaker_counts = {}
-        for s in all_speakers:
-            speaker_counts[s] = speaker_counts.get(s, 0) + 1
-        top2 = sorted(speaker_counts, key=lambda x: -speaker_counts[x])[:2]
-        speakers = set(top2)
-        turns = [t for t in turns if t["speaker"] in speakers]
-        if len(speakers) < 2:
+        duration = turns[-1]["end"] - turns[0]["start"]
+        if duration < self.min_block_duration:
+            log.info(f"Rejected: too short [{win_start:.2f}, {win_end:.2f}]")
             return None
 
-        # Must have enough back-and-forth exchanges
+        speakers = {t["speaker"] for t in turns}
+        if len(speakers) > 2:
+            log.info(f"Rejected: >2 speakers [{win_start:.2f}, {win_end:.2f}]")
+            return None
+        if len(speakers) < 2:
+            log.info(f"Rejected: <2 speakers [{win_start:.2f}, {win_end:.2f}]")
+            return None
+
         exchanges = sum(
             1 for i in range(1, len(turns))
             if turns[i]["speaker"] != turns[i - 1]["speaker"]
         )
         if exchanges < self.min_exchanges:
+            log.info(f"Rejected: weak alternation [{win_start:.2f}, {win_end:.2f}]")
             return None
 
-        start = turns[0]["start"]
-        end = turns[-1]["end"]
-        duration = end - start
-
-        # Must be long enough to be meaningful
-        if duration < self.min_block_duration:
+        speaker_time = Counter()
+        for t in turns:
+            speaker_time[t["speaker"]] += (t["end"] - t["start"])
+        times = list(speaker_time.values())
+        if min(times) / max(times) < 0.3:
+            log.info(f"Rejected: speaker imbalance [{win_start:.2f}, {win_end:.2f}]")
             return None
+
+        for i in range(1, len(turns)):
+            gap = turns[i]["start"] - turns[i - 1]["end"]
+            if gap > self.max_gap_sec:
+                log.info(f"Rejected: excessive gap [{win_start:.2f}, {win_end:.2f}]")
+                return None
 
         return {
-            "start": start,
-            "end": end,
+            "start": turns[0]["start"],
+            "end": turns[-1]["end"],
             "duration": duration,
-            "speakers": list(speakers),
+            "speakers": sorted(list(speakers)),
             "exchanges": exchanges,
             "turns": turns,
         }
+
+    def _merge_adjacent_blocks(self, blocks: list) -> list:
+        if not blocks:
+            return []
+        blocks = sorted(blocks, key=lambda x: x["start"])
+        merged = [blocks[0]]
+        for block in blocks[1:]:
+            prev = merged[-1]
+            if block["start"] <= prev["end"]:
+                prev["end"] = max(prev["end"], block["end"])
+                prev["duration"] = prev["end"] - prev["start"]
+                prev["turns"].extend(block["turns"])
+                prev["turns"] = sorted(prev["turns"], key=lambda x: x["start"])
+                prev["speakers"] = sorted(list({t["speaker"] for t in prev["turns"]}))
+                prev["exchanges"] = sum(
+                    1 for i in range(1, len(prev["turns"]))
+                    if prev["turns"][i]["speaker"] != prev["turns"][i - 1]["speaker"]
+                )
+            else:
+                merged.append(block)
+        return merged
+
+
+class PunjabiTranscriber:
+    def __init__(self, model_id: str = "openai/whisper-large-v3-turbo"):
+        from transformers import pipeline
+        self.pipe = pipeline(
+            task="automatic-speech-recognition",
+            model=model_id,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            device=0 if torch.cuda.is_available() else -1,
+        )
+
+    def transcribe_blocks(self, audio_path: str, blocks: list, output_path: str):
+        source = AudioSegment.from_file(audio_path)
+        lines = []
+        for i, block in enumerate(blocks, start=1):
+            speaker_map = {
+                spk: ("Speaker A" if idx == 0 else "Speaker B")
+                for idx, spk in enumerate(block["speakers"])
+            }
+            lines.append(
+                f"[Segment {i:02d}] {block['start']:.2f}s -> {block['end']:.2f}s"
+            )
+            for turn in block["turns"]:
+                speaker = turn["speaker"]
+                if speaker not in speaker_map:
+                    continue
+                start_ms = int(turn["start"] * 1000)
+                end_ms = int(turn["end"] * 1000)
+                chunk = source[start_ms:end_ms]
+                if len(chunk) < 300:
+                    continue
+                arr = np.array(chunk.get_array_of_samples()).astype(np.float32)
+                if chunk.channels > 1:
+                    arr = arr.reshape((-1, chunk.channels)).mean(axis=1)
+                arr = arr / max(np.iinfo(chunk.array_type).max, 1)
+                result = self.pipe(
+                    {"array": arr, "sampling_rate": chunk.frame_rate},
+                    generate_kwargs={"language": "pa", "task": "transcribe"},
+                )
+                text = result["text"].strip()
+                if text:
+                    lines.append(f"{speaker_map[speaker]}: {text}")
+            lines.append("")
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines).strip() + "\n")
+        log.info(f"Transcript saved → {output_path}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -291,7 +366,8 @@ def run(args):
         max_gap_sec=args.max_gap,
         min_exchanges=args.min_exchanges,
         min_block_duration=args.min_duration,
-        max_speakers=2,
+        window_size_sec=args.window_size,
+        window_hop_sec=args.window_hop,
     )
     blocks = detector.extract(turns)
 
@@ -310,9 +386,15 @@ def run(args):
     stitcher = Stitcher(crossfade_ms=args.crossfade)
     stitcher.stitch(audio_path, blocks, output_path)
 
+    # Step 5: Punjabi transcription (Gurmukhi)
+    log.info("\n── Step 5: Punjabi (Puadh) Speaker-wise Transcription ──")
+    transcriber = PunjabiTranscriber(model_id=args.asr_model)
+    transcriber.transcribe_blocks(audio_path, blocks, args.transcript_output)
+
     log.info("\n✓ Done!")
     log.info(f"  Input  : {audio_path}")
     log.info(f"  Output : {output_path}")
+    log.info(f"  Text   : {args.transcript_output}")
     log.info(f"  Blocks : {len(blocks)}")
     log.info(f"  Length : {total_conv/60:.1f} minutes of dialogue")
 
@@ -340,16 +422,24 @@ if __name__ == "__main__":
 
     # Tuning options
     parser.add_argument(
-        "--max_gap", type=float, default=5.0,
-        help="Max silence gap (seconds) between turns to stay in same block (default: 5.0)"
+        "--max_gap", type=float, default=2.5,
+        help="Max silence gap allowed inside a valid window (default: 2.5)"
     )
     parser.add_argument(
         "--min_exchanges", type=int, default=3,
         help="Minimum speaker alternations for a block to count as dialogue (default: 3)"
     )
     parser.add_argument(
-        "--min_duration", type=float, default=10.0,
-        help="Minimum block duration in seconds (default: 10.0)"
+        "--min_duration", type=float, default=5.0,
+        help="Minimum accepted window duration in seconds (default: 5.0)"
+    )
+    parser.add_argument(
+        "--window_size", type=float, default=8.0,
+        help="Sliding window size in seconds (default: 8.0)"
+    )
+    parser.add_argument(
+        "--window_hop", type=float, default=4.0,
+        help="Sliding window hop in seconds (default: 4.0)"
     )
     parser.add_argument(
         "--crossfade", type=int, default=150,
@@ -358,6 +448,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vad_sensitivity", type=int, default=2, choices=[0, 1, 2, 3],
         help="VAD aggressiveness 0-3 (default: 2)"
+    )
+    parser.add_argument(
+        "--transcript_output", default="conversation_punjabi.txt",
+        help="Path for speaker-wise Punjabi transcript output text"
+    )
+    parser.add_argument(
+        "--asr_model", default="openai/whisper-large-v3-turbo",
+        help="ASR model id for Punjabi transcription"
     )
 
     args = parser.parse_args()
